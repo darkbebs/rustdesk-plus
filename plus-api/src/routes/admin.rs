@@ -654,6 +654,12 @@ async fn exec_command(
     auth.require_admin()?;
     let tid = tenant_from_headers(&auth, &headers)?;
 
+    if !config::agent_enabled() {
+        return Err(AppError::BadRequest(
+            "Agente de gerenciamento desativado (AGENT_ENABLED=false).".to_string(),
+        ));
+    }
+
     let targets: Vec<String> = if let Some(t) = body.targets {
         t
     } else if let Some(tag_id) = body.tag_id {
@@ -924,6 +930,9 @@ async fn agent_binary_download(
     State(state): State<AppState>,
     Path(code): Path<String>,
 ) -> Result<Response<Body>, AppError> {
+    if !config::agent_enabled() {
+        return Err(AppError::NotFound);
+    }
     let tenant_id = tenant_by_install_code(&state.db, &code)
         .await
         .ok_or(AppError::NotFound)?;
@@ -967,12 +976,14 @@ async fn get_server_config(
     } else {
         (String::new(), String::new())
     };
+    let agent_enabled = config::agent_enabled();
     Ok(Json(json!({
         "server_ip": global.server_ip,
         "server_key": global.server_key,
         "api_url": global.api_url,
         "rustdesk_password": password,
         "install_code": install_code,
+        "agent_enabled": agent_enabled,
     })))
 }
 

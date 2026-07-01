@@ -30,6 +30,7 @@ var (
 	apiURL             = ""
 	unattendedPassword = ""
 	tenantID           = ""
+	agentEnabled       = "false" // injetado no build; "true" instala o agente de gerenciamento
 )
 
 const rustdeskDownload = "https://github.com/rustdesk/rustdesk/releases/download/1.3.9/rustdesk-1.3.9-x86_64.exe"
@@ -637,10 +638,12 @@ func runInstall(hwnd uintptr) {
 
 	// Etapa 4 — serviço
 	step(4)
-	status("Instalando agente de gerenciamento...", 78)
-	if err := installAgent(); err != nil {
-		fail("Erro no agente: " + err.Error())
-		return
+	if agentEnabled == "true" {
+		status("Instalando agente de gerenciamento...", 78)
+		if err := installAgent(); err != nil {
+			fail("Erro no agente: " + err.Error())
+			return
+		}
 	}
 
 	status("Ativando serviço de inicialização...", 86)

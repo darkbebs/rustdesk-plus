@@ -65,6 +65,7 @@ services:
       INSTALLER_PATH: /generated/rustdesk-installer.exe
       PUBLIC_HOST: ${PUBLIC_HOST:-}
       PUBLIC_API_URL: ${PUBLIC_API_URL:-}
+      AGENT_ENABLED: ${AGENT_ENABLED:-false}
     volumes:
       - ./data/rustdesk:/rustdesk-data:ro
       - ./data/deployment:/deployment

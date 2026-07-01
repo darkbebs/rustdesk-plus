@@ -46,6 +46,19 @@ async fn handle_agent(
         return;
     };
 
+    // Interruptor global (env AGENT_ENABLED): se o agente está desligado, recusa a conexão.
+    // Agentes novos recebem "disable" e hibernam; agentes antigos apenas caem e reconectam.
+    if !crate::config::agent_enabled() {
+        let _ = socket
+            .send(Message::Text(String::from("{\"type\":\"disable\"}").into()))
+            .await;
+        if let Some(dev) = resolve_device_uuid(&state, tenant_id, &uuid).await {
+            update_agent_presence(&state, tenant_id, &dev, false).await;
+        }
+        tracing::info!("agente recusado (AGENT_ENABLED=false): uuid={uuid} tenant={tenant_id}");
+        return;
+    }
+
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let registered_uuid = match ensure_agent_device(&state, tenant_id, &params).await {
         Some(device_uuid) => device_uuid,
@@ -67,6 +80,14 @@ async fn handle_agent(
     loop {
         tokio::select! {
             _ = presence_interval.tick() => {
+                // Reavalia o interruptor global: desligar AGENT_ENABLED derruba o agente em até 20s.
+                if !crate::config::agent_enabled() {
+                    let _ = socket
+                        .send(Message::Text(String::from("{\"type\":\"disable\"}").into()))
+                        .await;
+                    tracing::info!("agente desligado em runtime — desconectando: {registered_uuid} (tenant={tenant_id})");
+                    break;
+                }
                 update_agent_presence(&state, tenant_id, &registered_uuid, true).await;
             }
             cmd = rx.recv() => {

@@ -93,6 +93,7 @@ export type ServerConfig = {
   api_url: string;
   rustdesk_password: string;
   install_code: string;
+  agent_enabled?: boolean;
 };
 
 export type SetupStatus = Omit<ServerConfig, "rustdesk_password"> & {

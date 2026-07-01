@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { setToken, setActiveTenant, getActiveTenantId, getActiveTenantName, isSuperAdmin } from "@/lib/api";
+import { setToken, setActiveTenant, getActiveTenantId, getActiveTenantName, isSuperAdmin, getSetupStatus } from "@/lib/api";
 import { getStoredUser, setStoredUser } from "@/lib/auth";
 
 const navItems = [
@@ -33,6 +33,7 @@ export default function ProtectedLayout({ children }: { children: React.ReactNod
   const router = useRouter();
   const pathname = usePathname();
   const [ready, setReady] = useState(false);
+  const [agentEnabled, setAgentEnabled] = useState(false);
   // Inicializa direto do sessionStorage para não ter flash de nav errado na primeira render
   const [activeTenantName, setActiveTenantName] = useState<string | null>(() => {
     if (typeof window === "undefined") return null;
@@ -67,6 +68,13 @@ export default function ProtectedLayout({ children }: { children: React.ReactNod
     setActiveTenantName(getActiveTenantName());
   }, [pathname]);
 
+  // Descobre se o agente está habilitado no servidor (env AGENT_ENABLED)
+  useEffect(() => {
+    getSetupStatus()
+      .then((s) => setAgentEnabled(!!s.agent_enabled))
+      .catch(() => {});
+  }, []);
+
   function logout() {
     setToken(null);
     setStoredUser(null);
@@ -97,6 +105,11 @@ export default function ProtectedLayout({ children }: { children: React.ReactNod
       ? superAdminWithTenantNavItems
       : superAdminNavItems
     : navItems;
+  // Esconde Terminal e Scripts quando o agente está desligado (AGENT_ENABLED=false)
+  const agentHrefs = ["/terminal", "/scripts"];
+  const visibleNavItems = agentEnabled
+    ? allNavItems
+    : allNavItems.filter((n) => !agentHrefs.includes(n.href));
 
   return (
     <div className="flex h-screen bg-slate-50 overflow-hidden">
@@ -113,7 +126,7 @@ export default function ProtectedLayout({ children }: { children: React.ReactNod
 
         {/* Nav */}
         <nav className="flex-1 px-2 py-3 space-y-0.5 overflow-y-auto">
-          {allNavItems.map(({ href, label, icon }) => {
+          {visibleNavItems.map(({ href, label, icon }) => {
             const active = pathname === href || (href !== "/dashboard" && pathname.startsWith(href));
             return (
               <Link key={href} href={href}
