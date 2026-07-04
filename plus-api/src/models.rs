@@ -51,6 +51,7 @@ pub struct Device {
     pub last_seen_at: Option<DateTime<Utc>>,
     pub online: bool,
     pub created_at: DateTime<Utc>,
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]

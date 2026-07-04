@@ -154,7 +154,7 @@ async fn ensure_agent_device(state: &AppState, tenant_id: Uuid, params: &AgentPa
                 last_seen_at = now(),
                 online = true,
                 online_since = CASE WHEN online = false THEN now() ELSE online_since END
-            WHERE rustdesk_id = $1 AND tenant_id = $4
+            WHERE rustdesk_id = $1 AND tenant_id = $4 AND deleted_at IS NULL
             RETURNING uuid
             "#,
         )
@@ -189,6 +189,7 @@ async fn ensure_agent_device(state: &AppState, tenant_id: Uuid, params: &AgentPa
             last_seen_at = now(),
             online = true,
             online_since = CASE WHEN devices.online = false THEN now() ELSE devices.online_since END
+        WHERE devices.deleted_at IS NULL
         RETURNING uuid
         "#,
     )
@@ -197,11 +198,13 @@ async fn ensure_agent_device(state: &AppState, tenant_id: Uuid, params: &AgentPa
     .bind(hostname)
     .bind(&params.os)
     .bind(tenant_id)
-    .fetch_one(&state.db)
+    .fetch_optional(&state.db)
     .await;
 
     match result {
-        Ok(uuid) => Some(uuid),
+        Ok(Some(uuid)) => Some(uuid),
+        // Dispositivo existe mas está na lixeira (deleted_at): não recria até restaurar.
+        Ok(None) => None,
         Err(error) => {
             tracing::warn!("failed to register agent device {}: {error:?}", params.uuid);
             None

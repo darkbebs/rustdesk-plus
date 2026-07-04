@@ -36,6 +36,8 @@ pub fn router() -> Router<AppState> {
             get(get_device).delete(delete_device).post(patch_device),
         )
         .route("/admin/devices/:id", axum::routing::patch(patch_device_patch))
+        .route("/admin/devices/:id/restore", post(restore_device))
+        .route("/admin/devices/:id/purge", delete(purge_device))
         .route("/admin/devices/:id/branch", post(set_device_branch))
         .route("/admin/devices/:id/favorite", post(toggle_favorite))
         .route("/admin/devices/:id/tags", get(list_device_tags).post(add_device_tag))
@@ -118,8 +120,8 @@ async fn list_tenants(
     let tenants = sqlx::query_as::<_, TenantStats>(
         r#"
         SELECT t.id, t.name, t.slug, t.created_at,
-               (SELECT COUNT(*) FROM devices d WHERE d.tenant_id = t.id)              AS device_count,
-               (SELECT COUNT(*) FROM devices d WHERE d.tenant_id = t.id AND d.online) AS online_count,
+               (SELECT COUNT(*) FROM devices d WHERE d.tenant_id = t.id AND d.deleted_at IS NULL)              AS device_count,
+               (SELECT COUNT(*) FROM devices d WHERE d.tenant_id = t.id AND d.online AND d.deleted_at IS NULL) AS online_count,
                (SELECT COUNT(*) FROM users   u WHERE u.tenant_id = t.id)              AS user_count
         FROM tenants t
         ORDER BY t.created_at
@@ -318,6 +320,8 @@ pub struct DeviceFilter {
     pub search: Option<String>,
     pub online: Option<bool>,
     pub favorite: Option<bool>,
+    /// true = mostra apenas a lixeira (soft-deleted); false/ausente = apenas ativos.
+    pub deleted: Option<bool>,
 }
 
 async fn list_devices(
@@ -331,6 +335,7 @@ async fn list_devices(
         r#"
         SELECT * FROM devices
         WHERE tenant_id = $1
+          AND (CASE WHEN $6::boolean IS TRUE THEN deleted_at IS NOT NULL ELSE deleted_at IS NULL END)
           AND ($2::uuid IS NULL OR branch_id = $2)
           AND ($3::text IS NULL OR hostname ILIKE '%' || $3 || '%'
                                 OR rustdesk_id ILIKE '%' || $3 || '%'
@@ -345,6 +350,7 @@ async fn list_devices(
     .bind(filter.search)
     .bind(filter.online)
     .bind(filter.favorite)
+    .bind(filter.deleted)
     .fetch_all(&state.db)
     .await?;
     Ok(Json(devices))
@@ -376,7 +382,45 @@ async fn delete_device(
 ) -> Result<Json<serde_json::Value>, AppError> {
     auth.require_admin()?;
     let tid = tenant_from_headers(&auth, &headers)?;
-    sqlx::query("DELETE FROM devices WHERE id = $1 AND tenant_id = $2")
+    // Soft delete: marca deleted_at e derruba online. O heartbeat/sysinfo não recria
+    // (os UPSERTs têm WHERE devices.deleted_at IS NULL). Restaurável via /restore.
+    sqlx::query(
+        "UPDATE devices SET deleted_at = now(), online = false \
+         WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
+    )
+        .bind(id)
+        .bind(tid)
+        .execute(&state.db)
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn restore_device(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    auth.require_admin()?;
+    let tid = tenant_from_headers(&auth, &headers)?;
+    sqlx::query("UPDATE devices SET deleted_at = NULL WHERE id = $1 AND tenant_id = $2")
+        .bind(id)
+        .bind(tid)
+        .execute(&state.db)
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Remoção permanente — só age sobre o que já está na lixeira (deleted_at IS NOT NULL).
+async fn purge_device(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    auth.require_admin()?;
+    let tid = tenant_from_headers(&auth, &headers)?;
+    sqlx::query("DELETE FROM devices WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NOT NULL")
         .bind(id)
         .bind(tid)
         .execute(&state.db)
@@ -667,7 +711,7 @@ async fn exec_command(
             r#"
             SELECT d.uuid FROM devices d
             JOIN device_tags dt ON dt.device_id = d.id
-            WHERE dt.tag_id = $1 AND d.online = true AND d.tenant_id = $2
+            WHERE dt.tag_id = $1 AND d.online = true AND d.tenant_id = $2 AND d.deleted_at IS NULL
             "#,
         )
         .bind(tag_id)
@@ -676,7 +720,7 @@ async fn exec_command(
         .await?
     } else {
         sqlx::query_scalar::<_, String>(
-            "SELECT uuid FROM devices WHERE online = true AND tenant_id = $1",
+            "SELECT uuid FROM devices WHERE online = true AND tenant_id = $1 AND deleted_at IS NULL",
         )
         .bind(tid)
         .fetch_all(&state.db)
@@ -694,7 +738,7 @@ async fn exec_command(
     .await?;
 
     let device_rows: Vec<(Uuid, String)> = sqlx::query_as::<_, (Uuid, String)>(
-        "SELECT id, uuid FROM devices WHERE uuid = ANY($1) AND tenant_id = $2",
+        "SELECT id, uuid FROM devices WHERE uuid = ANY($1) AND tenant_id = $2 AND deleted_at IS NULL",
     )
     .bind(&targets)
     .bind(tid)
@@ -820,9 +864,9 @@ async fn get_stats(
     let stats = sqlx::query_as::<_, Stats>(
         r#"
         SELECT
-          (SELECT COUNT(*)::bigint FROM devices  WHERE tenant_id = $1)                      AS total_devices,
-          (SELECT COUNT(*)::bigint FROM devices  WHERE tenant_id = $1 AND online = true)    AS online_devices,
-          (SELECT COUNT(*)::bigint FROM devices  WHERE tenant_id = $1 AND online = false)   AS offline_devices,
+          (SELECT COUNT(*)::bigint FROM devices  WHERE tenant_id = $1 AND deleted_at IS NULL)                    AS total_devices,
+          (SELECT COUNT(*)::bigint FROM devices  WHERE tenant_id = $1 AND online = true  AND deleted_at IS NULL) AS online_devices,
+          (SELECT COUNT(*)::bigint FROM devices  WHERE tenant_id = $1 AND online = false AND deleted_at IS NULL) AS offline_devices,
           (SELECT COUNT(*)::bigint FROM branches WHERE tenant_id = $1)                      AS total_branches,
           (SELECT COUNT(*)::bigint FROM users    WHERE tenant_id = $1)                      AS total_users
         "#,

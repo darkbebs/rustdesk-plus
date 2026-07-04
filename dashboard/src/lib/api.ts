@@ -44,6 +44,7 @@ export type Device = {
   last_seen_at: string | null;
   online: boolean;
   created_at: string;
+  deleted_at: string | null;
 };
 
 export type Tag = {
@@ -252,12 +253,14 @@ export async function listDevices(filter: {
   search?: string;
   online?: boolean;
   favorite?: boolean;
+  deleted?: boolean;
 } = {}) {
   const params = new URLSearchParams();
   if (filter.branch_id) params.set("branch_id", filter.branch_id);
   if (filter.search) params.set("search", filter.search);
   if (filter.online !== undefined) params.set("online", String(filter.online));
   if (filter.favorite !== undefined) params.set("favorite", String(filter.favorite));
+  if (filter.deleted !== undefined) params.set("deleted", String(filter.deleted));
   const qs = params.toString();
   return request<Device[]>(`/admin/devices${qs ? `?${qs}` : ""}`);
 }
@@ -268,6 +271,14 @@ export async function getDevice(id: string) {
 
 export async function deleteDevice(id: string) {
   return request<{ ok: boolean }>(`/admin/devices/${id}`, { method: "DELETE" });
+}
+
+export async function restoreDevice(id: string) {
+  return request<{ ok: boolean }>(`/admin/devices/${id}/restore`, { method: "POST" });
+}
+
+export async function purgeDevice(id: string) {
+  return request<{ ok: boolean }>(`/admin/devices/${id}/purge`, { method: "DELETE" });
 }
 
 export async function patchDevice(id: string, data: { alias?: string; description?: string }) {
