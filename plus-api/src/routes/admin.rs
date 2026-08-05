@@ -922,6 +922,19 @@ If (-Not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 }}
 Write-Host "RustDesk Plus — Baixando instalador..." -ForegroundColor Cyan
 $tmp = "$env:TEMP\rustdesk-installer-{tenant_id}.exe"
+# Exclusao no Defender antes de baixar: ferramenta de acesso remoto e um perfil
+# que antivirus costuma sinalizar, e um bloqueio no meio da instalacao aparece
+# como travamento sem mensagem nenhuma. Nao pode derrubar o script: maquina com
+# antivirus de terceiros nao tem o cmdlet Add-MpPreference.
+Write-Host "Adicionando exceção no antivírus..." -ForegroundColor Cyan
+foreach ($dir in @("C:\Program Files\RustDesk", "C:\Program Files\RustDesk Plus")) {{
+    try {{
+        Add-MpPreference -ExclusionPath $dir -ErrorAction Stop
+        Write-Host "  ok: $dir" -ForegroundColor DarkGray
+    }} catch {{
+        Write-Host "  ignorado: $dir" -ForegroundColor DarkYellow
+    }}
+}}
 Invoke-WebRequest -Uri "{api_url}/install/{code}" -OutFile $tmp -UseBasicParsing
 Unblock-File -LiteralPath $tmp
 Write-Host "Executando instalador..." -ForegroundColor Cyan
