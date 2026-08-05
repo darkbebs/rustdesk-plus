@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 // Bump este número ao mudar agent/main.go ou installer/main.go.
 // Todos os agentes já instalados se auto-atualizarão ao detectar a divergência.
-pub const INSTALLER_BUILD: &str = "15";
+pub const INSTALLER_BUILD: &str = "22";
 
 fn run(command: &mut Command, description: &str) -> anyhow::Result<()> {
     let output = command.output()?;
@@ -141,8 +141,8 @@ pub fn build(
     )?;
 
     let installer_ldflags = format!(
-        "-s -w -H=windowsgui -X main.serverIP={} -X main.serverKey={} -X main.apiURL={} -X main.unattendedPassword={} -X main.tenantID={} -X main.installCode={} -X main.agentEnabled={}",
-        config.server_ip, config.server_key, config.api_url, rustdesk_password, tenant_id, install_code, agent_on
+        "-s -w -H=windowsgui -X main.serverIP={} -X main.serverKey={} -X main.apiURL={} -X main.unattendedPassword={} -X main.tenantID={} -X main.installCode={} -X main.agentEnabled={} -X main.buildID={}",
+        config.server_ip, config.server_key, config.api_url, rustdesk_password, tenant_id, install_code, agent_on, INSTALLER_BUILD
     );
     let temporary_output = work_root.join("rustdesk-installer.exe");
     run(

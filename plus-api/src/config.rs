@@ -13,10 +13,72 @@ pub struct ServerConfig {
     pub api_url: String,
 }
 
-fn generate_password() -> String {
+/// Codigo de instalacao: vai na URL (/i/CODIGO) e e digitado a mao, entao
+/// continua so com maiusculas e digitos. Nao segue as regras de senha do
+/// RustDesk porque nao e uma senha.
+fn generate_install_code() -> String {
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::thread_rng();
     (0..8).map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char).collect()
+}
+
+/// Gera senha aceita pelo cliente RustDesk.
+///
+/// O cliente exige digito, maiuscula, minuscula e tamanho >= 8. A versao antiga
+/// usava so maiusculas e digitos: o `--password` recusava a senha em silencio
+/// (saindo com codigo 0) e a maquina ficava com senha de uso unico.
+///
+/// Sem caracteres ambiguos (O/0, I/l/1) porque a senha e digitada a mao.
+fn generate_password() -> String {
+    const UPPER: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ";
+    const LOWER: &[u8] = b"abcdefghijkmnpqrstuvwxyz";
+    const DIGIT: &[u8] = b"23456789";
+
+    let mut rng = rand::thread_rng();
+    let pick = |rng: &mut rand::rngs::ThreadRng, set: &[u8]| set[rng.gen_range(0..set.len())] as char;
+
+    // Uma de cada classe garante as regras; o resto completa o tamanho.
+    let mut chars = vec![
+        pick(&mut rng, UPPER),
+        pick(&mut rng, LOWER),
+        pick(&mut rng, DIGIT),
+    ];
+    let all: Vec<u8> = [UPPER, LOWER, DIGIT].concat();
+    while chars.len() < 10 {
+        chars.push(pick(&mut rng, &all));
+    }
+    // Embaralha para as tres primeiras posicoes nao serem sempre da mesma classe.
+    for i in (1..chars.len()).rev() {
+        chars.swap(i, rng.gen_range(0..=i));
+    }
+    chars.into_iter().collect()
+}
+
+/// Regras que o cliente RustDesk aplica ao definir senha permanente.
+///
+/// Ele recusa em silencio: o `--password` sai com codigo 0 e nao grava nada, e a
+/// maquina fica com senha de uso unico. Melhor barrar na origem.
+pub fn validate_rustdesk_password(pwd: &str) -> Result<(), crate::error::AppError> {
+    let mut faltando = Vec::new();
+    if pwd.chars().count() < 8 {
+        faltando.push("pelo menos 8 caracteres");
+    }
+    if !pwd.chars().any(|c| c.is_ascii_digit()) {
+        faltando.push("um dígito");
+    }
+    if !pwd.chars().any(|c| c.is_ascii_uppercase()) {
+        faltando.push("uma letra maiúscula");
+    }
+    if !pwd.chars().any(|c| c.is_ascii_lowercase()) {
+        faltando.push("uma letra minúscula");
+    }
+    if faltando.is_empty() {
+        return Ok(());
+    }
+    Err(crate::error::AppError::BadRequest(format!(
+        "O RustDesk exige senha com {}.",
+        faltando.join(", ")
+    )))
 }
 
 async fn upsert_global(db: &PgPool, key: &str, value: &str) -> anyhow::Result<()> {
@@ -88,7 +150,7 @@ pub async fn ensure_tenant_install_code(db: &PgPool, tenant_id: Uuid) -> anyhow:
     if !existing.is_empty() {
         return Ok(existing);
     }
-    let code = generate_password(); // mesma lógica: 8 chars A-Z0-9
+    let code = generate_install_code();
     upsert_tenant(db, tenant_id, "install_code", &code).await?;
     Ok(code)
 }

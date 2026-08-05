@@ -925,8 +925,14 @@ $tmp = "$env:TEMP\rustdesk-installer-{tenant_id}.exe"
 Invoke-WebRequest -Uri "{api_url}/install/{code}" -OutFile $tmp -UseBasicParsing
 Unblock-File -LiteralPath $tmp
 Write-Host "Executando instalador..." -ForegroundColor Cyan
-Start-Process -FilePath $tmp -Verb RunAs -Wait
-Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+# Nada de -Wait: ele aguarda tambem os descendentes, e o instalador sobe o
+# RustDesk, que fica rodando de proposito. WaitForExit aguarda so o instalador.
+$proc = Start-Process -FilePath $tmp -Verb RunAs -PassThru
+$proc.WaitForExit()
+# .NET direto: o provider do PowerShell 5.1 falha em caminhos com "~" (nome
+# curto 8.3, que aparece quando o usuario do Windows tem acento no nome).
+try {{ [System.IO.File]::Delete($tmp) }} catch {{ }}
+Write-Host "Instalação finalizada." -ForegroundColor Green
 "#,
         api_url = api_url,
         code = code,
@@ -1062,6 +1068,10 @@ async fn save_server_config(
     // Qualquer admin pode atualizar a senha do seu tenant
     if let Some(pwd) = body.rustdesk_password.filter(|p| !p.trim().is_empty()) {
         let tid = tenant_from_headers(&auth, &headers)?;
+        // O cliente RustDesk recusa senha fora dessas regras — e recusa em
+        // silencio, saindo com codigo 0. Barrar aqui em vez de deixar a maquina
+        // instalar e so descobrir na hora de conectar.
+        config::validate_rustdesk_password(pwd.trim())?;
         config::save_tenant_password(&state.db, tid, pwd.trim()).await?;
     }
 

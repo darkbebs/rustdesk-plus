@@ -12,11 +12,15 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -33,6 +37,7 @@ var (
 	tenantID           = ""
 	installCode        = ""
 	agentEnabled       = "false" // injetado no build; "true" instala o agente de gerenciamento
+	buildID            = ""      // INSTALLER_BUILD; aparece no log para identificar o binario
 )
 
 const rustdeskDownload = "https://github.com/rustdesk/rustdesk/releases/download/1.3.9/rustdesk-1.3.9-x86_64.exe"
@@ -91,6 +96,10 @@ var (
 	_SetPixel             = gdi32.NewProc("SetPixel")
 	_MoveToEx             = gdi32.NewProc("MoveToEx")
 	_LineTo               = gdi32.NewProc("LineTo")
+	_CreateCompatibleDC   = gdi32.NewProc("CreateCompatibleDC")
+	_CreateCompatibleBmp  = gdi32.NewProc("CreateCompatibleBitmap")
+	_BitBlt               = gdi32.NewProc("BitBlt")
+	_DeleteDC             = gdi32.NewProc("DeleteDC")
 )
 
 // ── Constantes Win32 ─────────────────────────────────────────────────────────
@@ -111,6 +120,8 @@ const (
 	WM_COMMAND        = 0x0111
 	WM_CLOSE          = 0x0010
 	WM_CTLCOLORSTATIC = 0x0138
+	WM_ERASEBKGND     = 0x0014
+	SRCCOPY           = 0x00CC0020
 	WM_USER           = 0x0400
 	WM_APP_STATUS     = WM_USER + 1
 	WM_APP_PROGRESS   = WM_USER + 2
@@ -222,7 +233,37 @@ var (
 	installing bool
 	currentStep int // 0=idle 1-4=active step 5=done 6=error
 	progressPct int // 0-100
+
+	// Texto trocado entre a goroutine de instalacao e a UI. Nao da pra mandar
+	// ponteiro Go via PostMessageW: como uintptr, o GC nao ve referencia e pode
+	// liberar o buffer antes da thread da UI ler.
+	msgMu     sync.Mutex
+	statusMsg string
+	errorMsg  string
 )
+
+func setSharedMsg(dst *string, s string) {
+	msgMu.Lock()
+	*dst = s
+	msgMu.Unlock()
+}
+
+func getSharedMsg(src *string) string {
+	msgMu.Lock()
+	defer msgMu.Unlock()
+	return *src
+}
+
+// Uma janela Win32 pertence a thread que a criou, e so essa thread pode bombear
+// a fila de mensagens dela. O scheduler do Go migra goroutines entre threads do
+// SO livremente — sem travar a goroutine principal, o GetMessageW do loop pode
+// acordar em outra thread, passar a ler uma fila vazia e deixar a fila real da
+// janela sem ser drenada: a janela congela ("Nao esta respondendo").
+//
+// Precisa ser em init(), que roda na goroutine principal antes do main().
+func init() {
+	runtime.LockOSThread()
+}
 
 // ── Entry Point ───────────────────────────────────────────────────────────────
 func main() {
@@ -235,6 +276,8 @@ func main() {
 		relaunchAsAdmin()
 		return
 	}
+
+	logf("=== instalador iniciado (build %q, tenant %s) ===", buildID, tenantID)
 
 	icc := INITCOMMONCONTROLSEX{DwSize: 8, DwICC: ICC_PROGRESS_CLASS}
 	_InitCommonControlsEx.Call(uintptr(unsafe.Pointer(&icc)))
@@ -291,10 +334,30 @@ func wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 	case WM_CREATE:
 		createControls(hwnd)
 
+	case WM_ERASEBKGND:
+		// paintAll pinta a janela inteira; apagar o fundo antes so causa flicker.
+		return 1
+
 	case WM_PAINT:
 		var ps PAINTSTRUCT
 		hdc, _, _ := _BeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
-		paintAll(hdc)
+		// Double-buffer: pinta num bitmap na memoria e copia de uma vez.
+		memDC, _, _ := _CreateCompatibleDC.Call(hdc)
+		if memDC != 0 {
+			bmp, _, _ := _CreateCompatibleBmp.Call(hdc, winW, winH)
+			if bmp != 0 {
+				oldBmp, _, _ := _SelectObject.Call(memDC, bmp)
+				paintAll(memDC)
+				_BitBlt.Call(hdc, 0, 0, winW, winH, memDC, 0, 0, SRCCOPY)
+				_SelectObject.Call(memDC, oldBmp)
+				_DeleteObject.Call(bmp)
+			} else {
+				paintAll(hdc)
+			}
+			_DeleteDC.Call(memDC)
+		} else {
+			paintAll(hdc)
+		}
 		_EndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
 		return 0
 
@@ -314,8 +377,11 @@ func wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 		}
 
 	case WM_APP_STATUS:
-		text := windows.UTF16PtrToString((*uint16)(unsafe.Pointer(lParam)))
-		setWinText(hwndStat, text)
+		// Logado tambem aqui, na thread da UI: se as linhas "worker" continuarem
+		// e as "ui" pararem, o travamento e do message loop, nao do download.
+		s := getSharedMsg(&statusMsg)
+		logf("ui      %s", s)
+		setWinText(hwndStat, s)
 
 	case WM_APP_PROGRESS:
 		progressPct = int(wParam)
@@ -337,7 +403,7 @@ func wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 		_PostQuitMessage.Call(0)
 
 	case WM_APP_ERROR:
-		text := windows.UTF16PtrToString((*uint16)(unsafe.Pointer(lParam)))
+		text := getSharedMsg(&errorMsg)
 		currentStep = 6
 		progressPct = 0
 		installing = false
@@ -406,9 +472,11 @@ func paintAll(hdc uintptr) {
 	// Dot decorativo azul
 	dotBrush, _, _ := _CreateSolidBrush.Call(clrAccent)
 	dotPen, _, _ := _CreatePen.Call(PS_SOLID, 0, clrAccent)
-	_SelectObject.Call(hdc, dotBrush)
-	_SelectObject.Call(hdc, dotPen)
+	oldDotBr, _, _ := _SelectObject.Call(hdc, dotBrush)
+	oldDotPn, _, _ := _SelectObject.Call(hdc, dotPen)
 	_Ellipse.Call(hdc, padX, 28, padX+12, 40)
+	_SelectObject.Call(hdc, oldDotBr)
+	_SelectObject.Call(hdc, oldDotPn)
 	_DeleteObject.Call(dotBrush)
 	_DeleteObject.Call(dotPen)
 
@@ -498,9 +566,13 @@ func paintStep(hdc uintptr, idx int, label string) {
 
 	br, _, _ := _CreateSolidBrush.Call(fillColor)
 	pn, _, _ := _CreatePen.Call(PS_SOLID, 2, penColor)
-	_SelectObject.Call(hdc, br)
-	_SelectObject.Call(hdc, pn)
+	// Restaurar os objetos antigos antes de deletar: DeleteObject falha em
+	// objeto ainda selecionado no DC, e o handle vaza (limite de 10k por processo).
+	oldBr, _, _ := _SelectObject.Call(hdc, br)
+	oldPn, _, _ := _SelectObject.Call(hdc, pn)
 	_Ellipse.Call(hdc, uintptr(cx-r), uintptr(cy-r), uintptr(cx+r), uintptr(cy+r))
+	_SelectObject.Call(hdc, oldBr)
+	_SelectObject.Call(hdc, oldPn)
 	_DeleteObject.Call(br)
 	_DeleteObject.Call(pn)
 
@@ -559,13 +631,15 @@ func runInstall(hwnd uintptr) {
 		_PostMessageW.Call(hwnd, WM_APP_STEP, uintptr(n), 0)
 	}
 	status := func(s string, pct int) {
-		p, _ := windows.UTF16PtrFromString(s)
-		_PostMessageW.Call(hwnd, WM_APP_STATUS, 0, uintptr(unsafe.Pointer(p)))
+		logf("worker  %s", s)
+		setSharedMsg(&statusMsg, s)
+		_PostMessageW.Call(hwnd, WM_APP_STATUS, 0, 0)
 		_PostMessageW.Call(hwnd, WM_APP_PROGRESS, uintptr(pct), 0)
 	}
 	fail := func(s string) {
-		p, _ := windows.UTF16PtrFromString(s)
-		_PostMessageW.Call(hwnd, WM_APP_ERROR, 0, uintptr(unsafe.Pointer(p)))
+		logf("worker  ERRO: %s", s)
+		setSharedMsg(&errorMsg, s)
+		_PostMessageW.Call(hwnd, WM_APP_ERROR, 0, 0)
 	}
 
 	// Etapa 1 — parar processos
@@ -633,31 +707,7 @@ func runInstall(hwnd uintptr) {
 	clearRustDeskConfigDirs()
 
 	status("Aplicando configuração do servidor...", 55)
-	appData, _ := os.UserConfigDir()
-	configDir := filepath.Join(appData, "RustDesk", "config")
-	if err := os.MkdirAll(configDir, 0755); err != nil {
-		fail("Erro ao criar config: " + err.Error())
-		return
-	}
-
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "rendezvous_server = '%s:21116'\n", serverIP)
-	sb.WriteString("nat_type = 1\nserial = 0\n\n[options]\n")
-	fmt.Fprintf(&sb, "key = '%s'\n", serverKey)
-	fmt.Fprintf(&sb, "custom-rendezvous-server = '%s'\n", serverIP)
-	fmt.Fprintf(&sb, "relay-server = '%s'\n", serverIP)
-	effectiveAPIURL := apiURL
-	if apiURL != "" && tenantID != "" {
-		effectiveAPIURL = strings.TrimRight(apiURL, "/") + "/t/" + tenantID
-	}
-	if effectiveAPIURL != "" {
-		fmt.Fprintf(&sb, "api-server = '%s'\n", effectiveAPIURL)
-	}
-	if unattendedPassword != "" {
-		fmt.Fprintf(&sb, "permanent-password = '%s'\n", unattendedPassword)
-	}
-
-	if err := os.WriteFile(filepath.Join(configDir, "RustDesk2.toml"), []byte(sb.String()), 0644); err != nil {
+	if err := writeBaseConfig(); err != nil {
 		fail("Erro ao salvar config: " + err.Error())
 		return
 	}
@@ -671,16 +721,10 @@ func runInstall(hwnd uintptr) {
 		}
 	}
 
-	// A senha tem de ser definida PELO PROPRIO cliente (ele grava no formato
-	// interno dele) ANTES de propagar a config. O servico le o systemprofile —
-	// propagar antes deixava o servico com o valor escrito a mao no TOML, que o
-	// cliente nao aceita, resultando em "senha incorreta".
-	if unattendedPassword != "" {
-		status("Definindo senha de acesso remoto...", 68)
-		setRustDeskPasswordWithRetry(unattendedPassword)
-	}
-
-	status("Propagando configuração para o serviço...", 72)
+	// Propagar as opcoes AGORA, com o servico ainda parado: e a unica janela em
+	// que o RustDesk2.toml do usuario esta estavel. Com o servico no ar o cliente
+	// reescreve esse arquivo e apaga as opcoes.
+	status("Propagando configuração para o serviço...", 68)
 	propagateConfigToSystemProfile()
 
 	// Etapa 4 — serviço
@@ -693,18 +737,148 @@ func runInstall(hwnd uintptr) {
 		}
 	}
 
-	status("Ativando serviço de inicialização...", 86)
+	// O servico sobe ANTES da senha: o "--password" fala com ele por IPC e, com
+	// o servico parado, sai com codigo 0 sem gravar nada. Era esse o motivo de o
+	// RustDesk.toml nunca existir na hora de propagar.
+	status("Ativando serviço de inicialização...", 84)
 	installRustDeskService()
+	if !waitForServiceRunning(30 * time.Second) {
+		logf("worker  AVISO: serviço não entrou em RUNNING em 30s")
+	}
 
-	// Reinicia o servico para garantir que ele releia a config final (com a senha).
-	status("Reiniciando serviço...", 93)
+	if unattendedPassword != "" {
+		status("Definindo senha de acesso remoto...", 89)
+		if !setRustDeskPasswordWithRetry(unattendedPassword) {
+			fail("O cliente não gravou a senha de acesso. Veja %TEMP%\\rustdesk-install.log")
+			return
+		}
+		// So o RustDesk.toml: a propagacao completa faz RemoveAll no destino e
+		// apagaria o RustDesk2.toml que o servico ja tem com as opcoes.
+		status("Propagando senha para o serviço...", 92)
+		copyConfigFile("RustDesk.toml")
+	}
+
+	status("Reiniciando serviço...", 94)
 	restartRustDeskService()
+
+	// Conferir depois do servico subir: e ele que reescreve o config do usuario.
+	// Antes de abrir o cliente, para nao brigar com o arquivo.
+	status("Verificando configuração...", 95)
+	if !ensureFinalConfig(unattendedPassword) {
+		fail("A configuração não pôde ser aplicada. Veja %TEMP%\\rustdesk-install.log")
+		return
+	}
 
 	status("Iniciando RustDesk...", 97)
 	exec.Command(rustdeskExe).Start()
 
 	status("Instalação concluída!", 100)
 	_PostMessageW.Call(hwnd, WM_APP_DONE, 0, 0)
+}
+
+// ── Config: caminhos e verificacao ────────────────────────────────────────────
+
+func userConfigDir() string {
+	appData, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(appData, "RustDesk", "config")
+}
+
+// waitForConfigKeys aguarda as chaves aparecerem de fato no arquivo.
+//
+// Os comandos do cliente (--password, --option) saem com codigo 0 antes de a
+// escrita chegar ao disco. Confiar no codigo de saida foi o que deixou o
+// servico sem RustDesk.toml: a propagacao rodou 120ms depois do --password e
+// copiou uma pasta onde o arquivo ainda nao existia.
+func waitForConfigKeys(path string, keys []string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if data, err := os.ReadFile(path); err == nil {
+			missing := false
+			for _, k := range keys {
+				if !strings.Contains(string(data), k) {
+					missing = true
+					break
+				}
+			}
+			if !missing {
+				return true
+			}
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// configComplete diz se a pasta tem tudo que o RustDesk precisa para aceitar
+// conexao nao atendida: servidor/chave no RustDesk2.toml e, quando ha senha
+// configurada, o password/salt que o proprio cliente grava no RustDesk.toml.
+func configComplete(dir string) bool {
+	if !waitForConfigKeys(filepath.Join(dir, "RustDesk2.toml"),
+		[]string{"custom-rendezvous-server =", "key ="}, 0) {
+		return false
+	}
+	if unattendedPassword != "" &&
+		!waitForConfigKeys(filepath.Join(dir, "RustDesk.toml"),
+			[]string{"password =", "salt ="}, 0) {
+		return false
+	}
+	return true
+}
+
+// waitForServiceRunning aguarda o servico entrar em RUNNING.
+//
+// O "--password" do cliente conversa com o servico: com ele parado, o comando
+// sai com codigo 0 e nao grava nada. Era esse o bug — a senha era definida na
+// etapa 3 e o servico so subia na etapa 4.
+func waitForServiceRunning(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		cmd := exec.Command("sc", "query", "RustDesk")
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		out, _ := cmd.CombinedOutput()
+		if strings.Contains(string(out), "RUNNING") {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// writeBaseConfig grava o RustDesk2.toml do usuario com servidor, chave e API.
+//
+// Sem permanent-password de proposito: o cliente guarda esse campo em formato
+// interno criptografado, e um valor escrito a mao em texto puro e rejeitado na
+// conexao. Quem grava e o "--password"; assim a presenca do campo vira prova de
+// que o cliente realmente gravou.
+func writeBaseConfig() error {
+	configDir := userConfigDir()
+	if configDir == "" {
+		return fmt.Errorf("não foi possível localizar a pasta de configuração")
+	}
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		return err
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "rendezvous_server = '%s:21116'\n", serverIP)
+	sb.WriteString("nat_type = 1\nserial = 0\n\n[options]\n")
+	fmt.Fprintf(&sb, "key = '%s'\n", serverKey)
+	fmt.Fprintf(&sb, "custom-rendezvous-server = '%s'\n", serverIP)
+	fmt.Fprintf(&sb, "relay-server = '%s'\n", serverIP)
+	effectiveAPIURL := apiURL
+	if apiURL != "" && tenantID != "" {
+		effectiveAPIURL = strings.TrimRight(apiURL, "/") + "/t/" + tenantID
+	}
+	if effectiveAPIURL != "" {
+		fmt.Fprintf(&sb, "api-server = '%s'\n", effectiveAPIURL)
+	}
+	return os.WriteFile(filepath.Join(configDir, "RustDesk2.toml"), []byte(sb.String()), 0644)
 }
 
 // ── Helpers de opções ─────────────────────────────────────────────────────────
@@ -725,6 +899,16 @@ func applyRustDeskOptions() error {
 			return fmt.Errorf("%s: %v: %s", opt[0], err, strings.TrimSpace(string(out)))
 		}
 	}
+	// Conferir no disco: codigo 0 nao garante que a opcao foi gravada.
+	cfg := filepath.Join(userConfigDir(), "RustDesk2.toml")
+	keys := make([]string, 0, len(options))
+	for _, opt := range options {
+		keys = append(keys, opt[0]+" =")
+	}
+	if !waitForConfigKeys(cfg, keys, 15*time.Second) {
+		return fmt.Errorf("opções não apareceram em %s", cfg)
+	}
+	logf("worker  opções confirmadas em %s", cfg)
 	return nil
 }
 
@@ -774,8 +958,25 @@ func propagateConfigToSystemProfile() {
 	srcDir := filepath.Join(appData, "RustDesk", "config")
 	entries, err := os.ReadDir(srcDir)
 	if err != nil {
+		logf("worker  propagacao abortada, %s ilegivel: %v", srcDir, err)
 		return
 	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			names = append(names, e.Name())
+		}
+	}
+
+	// A propagacao apaga o destino antes de copiar. Se a origem estiver
+	// incompleta, isso destroi uma config de servico que estava correta — foi
+	// o que aconteceu quando o reparo rodou com a pasta do usuario ja limpa
+	// pelo servico. Melhor nao propagar do que propagar pior.
+	if !configComplete(srcDir) {
+		logf("worker  propagacao cancelada: origem incompleta (%s)", strings.Join(names, ", "))
+		return
+	}
+	logf("worker  propagando %d arquivo(s): %s", len(names), strings.Join(names, ", "))
 	dsts := []string{
 		`C:\Windows\System32\config\systemprofile\AppData\Roaming\RustDesk\config`,
 		`C:\Windows\SysWOW64\config\systemprofile\AppData\Roaming\RustDesk\config`,
@@ -798,15 +999,113 @@ func propagateConfigToSystemProfile() {
 	}
 }
 
-func setRustDeskPasswordWithRetry(password string) {
+// systemProfileConfigDirs sao as pastas lidas pelo servico, que roda como SYSTEM.
+var systemProfileConfigDirs = []string{
+	`C:\Windows\System32\config\systemprofile\AppData\Roaming\RustDesk\config`,
+	`C:\Windows\SysWOW64\config\systemprofile\AppData\Roaming\RustDesk\config`,
+}
+
+// copyConfigFile copia um unico arquivo da pasta do usuario para o systemprofile,
+// sem apagar o resto. A propagacao completa faz RemoveAll no destino, o que
+// destroi a config que o servico ja tem quando a origem esta incompleta.
+func copyConfigFile(name string) bool {
+	data, err := os.ReadFile(filepath.Join(userConfigDir(), name))
+	if err != nil {
+		logf("worker  %s ilegivel: %v", name, err)
+		return false
+	}
+	ok := false
+	for _, dst := range systemProfileConfigDirs {
+		if err := os.MkdirAll(dst, 0755); err != nil {
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(dst, name), data, 0644); err == nil {
+			ok = true
+		}
+	}
+	logf("worker  %s copiado para o systemprofile: %v", name, ok)
+	return ok
+}
+
+// ensureFinalConfig confere o estado que realmente importa e refaz se preciso.
+//
+// Subir o servico faz o cliente reescrever o RustDesk2.toml do usuario e apagar
+// as opcoes do instalador. Como isso depende de corrida, nao basta reordenar: e
+// preciso conferir o resultado e corrigir.
+func ensureFinalConfig(password string) bool {
+	okUser := configComplete(userConfigDir())
+	okSvc := configComplete(systemProfileConfigDirs[0])
+	logf("worker  config: usuario=%v servico=%v", okUser, okSvc)
+
+	// Quem decide a conexao nao atendida e a config do servico, que roda como
+	// SYSTEM. A do usuario e reescrita pelo cliente toda vez que o servico sobe;
+	// insistir nela era o que fazia o reparo rodar em circulos.
+	if okSvc {
+		if !okUser {
+			logf("worker  config do usuario incompleta (o cliente reescreveu); serviço OK, seguindo")
+		}
+		return true
+	}
+
+	logf("worker  serviço sem config valida — refazendo")
+
+	// Mesma sequencia do fluxo principal: opcoes com o servico parado (unica
+	// janela em que o RustDesk2.toml fica estavel), senha com ele no ar.
+	stopRustDeskProcesses()
+	if err := writeBaseConfig(); err != nil {
+		logf("worker  reescrever config base falhou: %v", err)
+		return false
+	}
+	if err := applyRustDeskOptions(); err != nil {
+		logf("worker  reaplicar opções falhou: %v", err)
+		return false
+	}
+	// A guarda interna recusa origem incompleta, para nao apagar um destino bom.
+	propagateConfigToSystemProfile()
+
+	installRustDeskService()
+	if !waitForServiceRunning(30 * time.Second) {
+		logf("worker  serviço não subiu para regravar a senha")
+		return false
+	}
+	if password != "" {
+		if !setRustDeskPasswordWithRetry(password) {
+			logf("worker  cliente nao gravou a senha")
+			return false
+		}
+		copyConfigFile("RustDesk.toml")
+	}
+	restartRustDeskService()
+
+	okSvc = configComplete(systemProfileConfigDirs[0])
+	logf("worker  serviço apos correcao: %v", okSvc)
+	return okSvc
+}
+
+func setRustDeskPasswordWithRetry(password string) bool {
+	// A senha permanente e o "password" (criptografado) do RustDesk.toml, junto
+	// com o "salt" — foi o que o teste manual mostrou apos subir o servico.
+	cfg := filepath.Join(userConfigDir(), "RustDesk.toml")
 	for i := 0; i < 6; i++ {
 		cmd := exec.Command(rustdeskExe, "--password", password)
 		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-		if _, err := cmd.CombinedOutput(); err == nil {
-			return
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			logf("worker  --password tentativa %d falhou: %v: %s",
+				i+1, err, strings.TrimSpace(string(out)))
+			time.Sleep(2 * time.Second)
+			continue
 		}
+		if waitForConfigKeys(cfg, []string{"password =", "salt ="}, 15*time.Second) {
+			logf("worker  senha confirmada em %s (tentativa %d)", cfg, i+1)
+			return true
+		}
+		// Sai 0 sem gravar quando o servico nao esta rodando.
+		logf("worker  --password saiu 0 sem gravar (tentativa %d); serviço RUNNING=%v",
+			i+1, waitForServiceRunning(0))
 		time.Sleep(2 * time.Second)
 	}
+	return false
 }
 
 func installRustDeskService() {
@@ -868,6 +1167,35 @@ func createFont(size int, bold bool) uintptr {
 	return h
 }
 
+// ── Log de diagnostico ────────────────────────────────────────────────────────
+// Grava em %TEMP%\rustdesk-install.log. Numa maquina remota e a unica forma de
+// saber onde parou sem depender de deducao.
+var (
+	logMu   sync.Mutex
+	logFile *os.File
+)
+
+func logf(format string, args ...any) {
+	logMu.Lock()
+	defer logMu.Unlock()
+	if logFile == nil {
+		f, err := os.OpenFile(
+			filepath.Join(os.TempDir(), "rustdesk-install.log"),
+			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return
+		}
+		// BOM: sem ele o Get-Content do PowerShell 5.1 le como ANSI e quebra os acentos.
+		if st, serr := f.Stat(); serr == nil && st.Size() == 0 {
+			f.Write([]byte{0xEF, 0xBB, 0xBF})
+		}
+		logFile = f
+	}
+	fmt.Fprintf(logFile, "%s  %s\n",
+		time.Now().Format("15:04:05.000"), fmt.Sprintf(format, args...))
+	logFile.Sync() // travamento = processo morto sem flush; sem Sync o log some
+}
+
 func setWinText(hwnd uintptr, s string) {
 	p, _ := windows.UTF16PtrFromString(s)
 	_SetWindowTextW.Call(hwnd, uintptr(unsafe.Pointer(p)))
@@ -909,45 +1237,109 @@ func relaunchAsAdmin() {
 	)
 }
 
+// stallTimeout aborta o download se nenhum byte chegar nesse intervalo. Sem
+// isso, uma conexao pendurada congela a instalacao para sempre.
+const stallTimeout = 90 * time.Second
+
+var httpClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: 20 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   20 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+	},
+}
+
 func downloadWithProgress(url, dest string, progress func(int)) error {
-	resp, err := http.Get(url)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("servidor respondeu %s", resp.Status)
+	}
+
 	f, err := os.Create(dest)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+
+	// Watchdog: cancela o request se o stream parar de entregar bytes.
+	var lastRead atomic.Int64
+	lastRead.Store(time.Now().UnixNano())
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-stopWatch:
+				return
+			case <-t.C:
+				if time.Since(time.Unix(0, lastRead.Load())) > stallTimeout {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
 	total := resp.ContentLength
 	var done int64
-	buf := make([]byte, 32*1024)
+	lastPct := -1
+	buf := make([]byte, 128*1024)
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
-			f.Write(buf[:n])
+			lastRead.Store(time.Now().UnixNano())
+			if _, werr := f.Write(buf[:n]); werr != nil {
+				return werr
+			}
 			done += int64(n)
+			// So notifica quando o percentual inteiro muda: cada notificacao
+			// repinta a janela toda, e um repaint por chunk trava a UI.
 			if total > 0 {
-				progress(int(float64(done) / float64(total) * 100))
+				if pct := int(float64(done) / float64(total) * 100); pct != lastPct {
+					lastPct = pct
+					progress(pct)
+				}
 			}
 		}
 		if err == io.EOF {
-			return nil
+			break
 		}
 		if err != nil {
+			if ctx.Err() != nil {
+				return fmt.Errorf("download travou (sem dados por %s)", stallTimeout)
+			}
 			return err
 		}
 	}
+	// Download truncado passaria despercebido e instalaria um exe corrompido.
+	if total > 0 && done != total {
+		return fmt.Errorf("download incompleto: %d de %d bytes", done, total)
+	}
+	return f.Sync()
 }
 
 // downloadBranded tenta baixar o cliente com marca do tenant. true se OK.
 func downloadBranded(dest string, progress func(int)) bool {
 	url := strings.TrimRight(apiURL, "/") + "/api/branded/" + installCode
 	if err := downloadWithProgress(url, dest, progress); err != nil {
+		os.Remove(dest) // nao deixar arquivo parcial para tras
 		return false
 	}
 	if fi, err := os.Stat(dest); err != nil || fi.Size() < 1024*1024 {
+		os.Remove(dest)
 		return false // muito pequeno = provavelmente erro/404, nao um exe
 	}
 	return true
