@@ -752,10 +752,20 @@ func runInstall(hwnd uintptr) {
 			fail("O cliente não gravou a senha de acesso. Veja %TEMP%\\rustdesk-install.log")
 			return
 		}
-		// So o RustDesk.toml: a propagacao completa faz RemoveAll no destino e
-		// apagaria o RustDesk2.toml que o servico ja tem com as opcoes.
+		// Nada de propagacao completa aqui: ela faz RemoveAll no destino e
+		// apagaria o RustDesk2.toml que o servico ja tem com as opcoes. O
+		// RustDesk.toml (id, salt, key_pair) vai inteiro; a senha permanente e
+		// transplantada chave a chave para dentro do RustDesk2.toml do servico.
+		//
+		// Com o servico parado: ao encerrar ele regrava o proprio RustDesk2.toml
+		// a partir do que tem em memoria e apagaria a senha recem-escrita.
 		status("Propagando senha para o serviço...", 92)
+		stopRustDeskService()
 		copyConfigFile("RustDesk.toml")
+		if !propagatePermanentPassword() {
+			fail("A senha não pôde ser propagada para o serviço. Veja %TEMP%\\rustdesk-install.log")
+			return
+		}
 	}
 
 	status("Reiniciando serviço...", 94)
@@ -815,19 +825,82 @@ func waitForConfigKeys(path string, keys []string, timeout time.Duration) bool {
 }
 
 // configComplete diz se a pasta tem tudo que o RustDesk precisa para aceitar
-// conexao nao atendida: servidor/chave no RustDesk2.toml e, quando ha senha
-// configurada, o password/salt que o proprio cliente grava no RustDesk.toml.
+// conexao nao atendida: servidor/chave e a senha permanente, ambos no
+// RustDesk2.toml.
+//
+// A senha permanente e o "permanent-password" do RustDesk2.toml, nao o
+// "password" do RustDesk.toml — este ultimo e a senha TEMPORARIA, e no 1.4.8
+// fica vazio ("password = ''") quando so ha senha fixa. Conferir a presenca da
+// chave "password =" dava positivo com valor vazio: a instalacao terminava "ok"
+// e a conexao recusava a senha.
 func configComplete(dir string) bool {
-	if !waitForConfigKeys(filepath.Join(dir, "RustDesk2.toml"),
-		[]string{"custom-rendezvous-server =", "key ="}, 0) {
+	if !serverConfigComplete(dir) {
 		return false
 	}
 	if unattendedPassword != "" &&
-		!waitForConfigKeys(filepath.Join(dir, "RustDesk.toml"),
-			[]string{"password =", "salt ="}, 0) {
+		readOption(filepath.Join(dir, "RustDesk2.toml"), "permanent-password") == "" {
 		return false
 	}
 	return true
+}
+
+// serverConfigComplete olha so servidor e chave. E a guarda da propagacao, que
+// roda na etapa 3, antes de existir senha: exigir a senha ali cancelaria a
+// propagacao e deixaria o servico sem config nenhuma.
+func serverConfigComplete(dir string) bool {
+	return waitForConfigKeys(filepath.Join(dir, "RustDesk2.toml"),
+		[]string{"custom-rendezvous-server =", "key ="}, 0)
+}
+
+// readOption devolve o valor de uma chave "nome = 'valor'" do toml, ou "" se
+// ausente ou vazia. Nao e um parser de TOML: serve para as chaves de uma linha
+// que o RustDesk grava em [options].
+func readOption(path, key string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, key) {
+			continue
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(trimmed, key))
+		if !strings.HasPrefix(rest, "=") {
+			continue // "permanent-password" nao pode casar com outra chave maior
+		}
+		value := strings.TrimSpace(strings.TrimPrefix(rest, "="))
+		return strings.Trim(value, "'\"")
+	}
+	return ""
+}
+
+// upsertOption grava nome = 'valor' na secao [options] do toml, preservando o
+// resto do arquivo. Usado para levar a senha permanente ate a config do
+// servico sem sobrescrever as opcoes que ele ja tem.
+func upsertOption(path, key, value string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(string(data), "\n")
+	entry := fmt.Sprintf("%s = '%s'", key, value)
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		rest := strings.TrimSpace(strings.TrimPrefix(trimmed, key))
+		if strings.HasPrefix(trimmed, key) && strings.HasPrefix(rest, "=") {
+			lines[i] = entry
+			return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0644)
+		}
+	}
+	// Sem a chave: acrescenta no fim, dentro de [options]. O RustDesk grava
+	// [options] como ultima secao do arquivo; se nao existir, abre a secao.
+	out := strings.TrimRight(string(data), "\n")
+	if !strings.Contains(out, "[options]") {
+		out += "\n\n[options]"
+	}
+	out += "\n" + entry + "\n"
+	return os.WriteFile(path, []byte(out), 0644)
 }
 
 // waitForServiceRunning aguarda o servico entrar em RUNNING.
@@ -972,7 +1045,7 @@ func propagateConfigToSystemProfile() {
 	// incompleta, isso destroi uma config de servico que estava correta — foi
 	// o que aconteceu quando o reparo rodou com a pasta do usuario ja limpa
 	// pelo servico. Melhor nao propagar do que propagar pior.
-	if !configComplete(srcDir) {
+	if !serverConfigComplete(srcDir) {
 		logf("worker  propagacao cancelada: origem incompleta (%s)", strings.Join(names, ", "))
 		return
 	}
@@ -1073,7 +1146,12 @@ func ensureFinalConfig(password string) bool {
 			logf("worker  cliente nao gravou a senha")
 			return false
 		}
+		stopRustDeskService()
 		copyConfigFile("RustDesk.toml")
+		if !propagatePermanentPassword() {
+			logf("worker  senha nao chegou ao servico")
+			return false
+		}
 	}
 	restartRustDeskService()
 
@@ -1083,9 +1161,11 @@ func ensureFinalConfig(password string) bool {
 }
 
 func setRustDeskPasswordWithRetry(password string) bool {
-	// A senha permanente e o "password" (criptografado) do RustDesk.toml, junto
-	// com o "salt" — foi o que o teste manual mostrou apos subir o servico.
-	cfg := filepath.Join(userConfigDir(), "RustDesk.toml")
+	// A senha permanente e o "permanent-password" do RustDesk2.toml, gravado
+	// criptografado pelo proprio cliente. O "password" do RustDesk.toml e a
+	// senha temporaria e fica vazio quando so ha senha fixa — conferir a
+	// presenca dele dava positivo sem senha nenhuma.
+	cfg := filepath.Join(userConfigDir(), "RustDesk2.toml")
 	for i := 0; i < 6; i++ {
 		cmd := exec.Command(rustdeskExe, "--password", password)
 		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
@@ -1096,7 +1176,7 @@ func setRustDeskPasswordWithRetry(password string) bool {
 			time.Sleep(2 * time.Second)
 			continue
 		}
-		if waitForConfigKeys(cfg, []string{"password =", "salt ="}, 15*time.Second) {
+		if waitForOptionValue(cfg, "permanent-password", 15*time.Second) {
 			logf("worker  senha confirmada em %s (tentativa %d)", cfg, i+1)
 			return true
 		}
@@ -1106,6 +1186,59 @@ func setRustDeskPasswordWithRetry(password string) bool {
 		time.Sleep(2 * time.Second)
 	}
 	return false
+}
+
+// waitForOptionValue aguarda a chave aparecer COM valor. Codigo de saida 0 nao
+// garante escrita, e a chave pode existir vazia.
+func waitForOptionValue(path, key string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if readOption(path, key) != "" {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// propagatePermanentPassword leva a senha que o cliente gravou para a config do
+// servico, que e quem valida a conexao nao atendida.
+//
+// Copiar o RustDesk2.toml inteiro sobrescreveria as opcoes que o servico ja
+// tem; entao so a chave da senha e transplantada. O valor vai como o cliente
+// gravou (criptografado): escrito em texto puro, o RustDesk o rejeita.
+func propagatePermanentPassword() bool {
+	value := readOption(filepath.Join(userConfigDir(), "RustDesk2.toml"), "permanent-password")
+	if value == "" {
+		logf("worker  senha permanente ausente na config do usuario — nada a propagar")
+		return false
+	}
+	ok := false
+	for _, dst := range systemProfileConfigDirs {
+		if err := os.MkdirAll(dst, 0755); err != nil {
+			continue
+		}
+		path := filepath.Join(dst, "RustDesk2.toml")
+		if _, err := os.Stat(path); err != nil {
+			// Servico sem RustDesk2.toml: leva o do usuario inteiro, ja que nao
+			// ha opcoes dele para preservar.
+			if data, rerr := os.ReadFile(filepath.Join(userConfigDir(), "RustDesk2.toml")); rerr == nil {
+				if werr := os.WriteFile(path, data, 0644); werr == nil {
+					ok = true
+				}
+			}
+			continue
+		}
+		if err := upsertOption(path, "permanent-password", value); err != nil {
+			logf("worker  falha ao gravar a senha em %s: %v", path, err)
+			continue
+		}
+		ok = true
+	}
+	logf("worker  senha permanente propagada para o systemprofile: %v", ok)
+	return ok
 }
 
 func installRustDeskService() {
@@ -1465,6 +1598,15 @@ func ensureCanonicalExe() {
 
 // restartRustDeskService reinicia o servico para que ele releia a config final
 // (servidor, key, api-server e senha) gravada durante a instalacao.
+// stopRustDeskService para so o servico (sem matar o cliente do usuario) e da
+// tempo de ele gravar o que tem em memoria antes de escrevermos por cima.
+func stopRustDeskService() {
+	stop := exec.Command("sc", "stop", "RustDesk")
+	stop.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	_ = stop.Run()
+	time.Sleep(3 * time.Second)
+}
+
 func restartRustDeskService() {
 	stop := exec.Command("sc", "stop", "RustDesk")
 	stop.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
