@@ -11,6 +11,7 @@ import {
   downloadInstaller,
   type TenantBranding,
 } from "@/lib/api";
+import { defenderExclusionCmd, installCmdFor } from "@/lib/install-cmd";
 
 type Form = {
   app_name: string;
@@ -57,7 +58,7 @@ export default function CustomClientPage() {
   const [saved, setSaved] = useState(false);
   const [building, setBuilding] = useState(false);
   const [downloading, setDownloading] = useState(false);
-  const [copied, setCopied] = useState(false);
+  const [copied, setCopied] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -178,18 +179,13 @@ export default function CustomClientPage() {
     }
   }
 
-  // Prefixo de TLS 1.2: PowerShell antigo (Win 7/8/2012/2016) tenta TLS 1.0 e falha
-  // no HTTPS moderno. Não desabilita validação de certificado.
-  const installCmd =
-    apiBase && installCode
-      ? `[Net.ServicePointManager]::SecurityProtocol='Tls12'; irm ${apiBase}/i/${installCode} | iex`
-      : "";
+  const installCmd = apiBase && installCode ? installCmdFor(apiBase, installCode) : "";
 
-  function copyCmd() {
-    if (!installCmd) return;
-    navigator.clipboard.writeText(installCmd).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+  function copyCmd(key: string, text: string) {
+    if (!text) return;
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(key);
+      setTimeout(() => setCopied(null), 2000);
     });
   }
 
@@ -318,18 +314,36 @@ export default function CustomClientPage() {
               {downloading ? "Baixando…" : "Baixar instalador"}
             </button>
             {installCmd && (
-              <div>
+              <div className="space-y-3">
                 <label className="block text-xs font-medium text-slate-500">
-                  Ou instale por linha de comando (PowerShell como administrador)
+                  Ou instale por linha de comando — na mesma janela do PowerShell,{" "}
+                  <strong>como administrador</strong>, rode os dois na ordem:
                 </label>
-                <div className="mt-1 flex items-center gap-2">
-                  <code className="flex-1 min-w-0 truncate rounded-lg bg-slate-900 px-3 py-2 text-xs text-slate-100">
-                    {installCmd}
-                  </code>
-                  <button onClick={copyCmd}
-                    className="flex-shrink-0 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-blue-600 hover:bg-blue-50">
-                    {copied ? "✓ Copiado" : "Copiar"}
-                  </button>
+                <div>
+                  <p className="text-xs text-slate-500">
+                    1. Exceções no antivírus (o Defender bloqueia a gravação da senha em silêncio)
+                  </p>
+                  <div className="mt-1 flex items-center gap-2">
+                    <code className="flex-1 min-w-0 truncate rounded-lg bg-slate-900 px-3 py-2 text-xs text-slate-100">
+                      {defenderExclusionCmd}
+                    </code>
+                    <button onClick={() => copyCmd("defender", defenderExclusionCmd)}
+                      className="flex-shrink-0 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-blue-600 hover:bg-blue-50">
+                      {copied === "defender" ? "✓ Copiado" : "Copiar"}
+                    </button>
+                  </div>
+                </div>
+                <div>
+                  <p className="text-xs text-slate-500">2. Instalador</p>
+                  <div className="mt-1 flex items-center gap-2">
+                    <code className="flex-1 min-w-0 truncate rounded-lg bg-slate-900 px-3 py-2 text-xs text-slate-100">
+                      {installCmd}
+                    </code>
+                    <button onClick={() => copyCmd("install", installCmd)}
+                      className="flex-shrink-0 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-blue-600 hover:bg-blue-50">
+                      {copied === "install" ? "✓ Copiado" : "Copiar"}
+                    </button>
+                  </div>
                 </div>
               </div>
             )}

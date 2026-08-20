@@ -9,6 +9,7 @@ import {
   type ServerConfig,
 } from "@/lib/api";
 import { getStoredUser } from "@/lib/auth";
+import { defenderExclusionCmd, installCmdFor } from "@/lib/install-cmd";
 
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
@@ -221,13 +222,23 @@ export default function SettingsPage() {
           <div className="space-y-2">
             <p className="text-xs font-semibold text-slate-400 uppercase tracking-widest">Instalar via PowerShell</p>
             <p className="text-xs text-slate-400">
-              Execute no PC do cliente como Administrador — baixa e instala automaticamente:
+              Execute no PC do cliente como Administrador, os dois comandos na ordem:
+            </p>
+            <p className="text-xs text-slate-400">
+              1. Exceções no antivírus — o Defender bloqueia a gravação da senha sem avisar:
             </p>
             <div className="flex items-center gap-2">
               <code className="flex-1 bg-slate-900 text-green-400 text-xs font-mono rounded-xl px-4 py-2.5 overflow-x-auto whitespace-nowrap">
-                irm &quot;{config.api_url.replace(/\/$/, "")}/i/{config.install_code}&quot; | iex
+                {defenderExclusionCmd}
               </code>
-              <CopyButton text={`irm "${config.api_url.replace(/\/$/, "")}/i/${config.install_code}" | iex`} />
+              <CopyButton text={defenderExclusionCmd} />
+            </div>
+            <p className="text-xs text-slate-400">2. Instalador — baixa e instala automaticamente:</p>
+            <div className="flex items-center gap-2">
+              <code className="flex-1 bg-slate-900 text-green-400 text-xs font-mono rounded-xl px-4 py-2.5 overflow-x-auto whitespace-nowrap">
+                {installCmdFor(config.api_url, config.install_code)}
+              </code>
+              <CopyButton text={installCmdFor(config.api_url, config.install_code)} />
             </div>
             <div className="flex items-center gap-2 pt-1">
               <span className="text-xs text-slate-400">Código:</span>
