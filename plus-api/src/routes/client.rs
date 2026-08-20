@@ -7,7 +7,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use uuid::Uuid;
 
 use crate::{error::AppError, state::AppState};
@@ -35,6 +35,24 @@ pub fn router() -> Router<AppState> {
         .route("/t/:tenant_id/api/sysinfo_ver", post(sysinfo_ver))
         .route("/t/:tenant_id/api/ab/get", post(ab_get))
         .route("/t/:tenant_id/api/ab", post(ab_set))
+}
+
+/// Um IP privado/loopback nao identifica uma filial: quando o proxy nao repassa
+/// o endereco real, todos os dispositivos chegam com o mesmo IP e a heuristica
+/// de auto-filial passaria a casar qualquer dispositivo com qualquer outro.
+fn is_public_ip(ip: &str) -> bool {
+    match ip.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => {
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])))
+        }
+        Ok(IpAddr::V6(v6)) => !(v6.is_loopback() || v6.is_unspecified()),
+        Err(_) => false,
+    }
 }
 
 fn extract_ip(addr: SocketAddr, headers: &HeaderMap) -> String {
@@ -141,7 +159,16 @@ async fn heartbeat_inner(
     .execute(&state.db)
     .await?;
 
-    // Auto-filial por IP dentro do mesmo tenant
+    // Auto-filial por IP dentro do mesmo tenant (somente com IP publico real)
+    if !is_public_ip(&ip) {
+        tracing::debug!(
+            "auto-filial ignorada: ip nao publico ({}) para uuid={}",
+            ip,
+            body.uuid
+        );
+        return Ok(Json(json!({})));
+    }
+
     sqlx::query(
         r#"
         UPDATE devices AS d

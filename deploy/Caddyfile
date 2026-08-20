@@ -7,6 +7,16 @@
 # Para HTTPS, o Caddy obtém e renova o certificado Let's Encrypt automaticamente.
 # Exige que as portas 80 e 443 estejam abertas e apontando para este servidor.
 
+# Quando o Caddy roda atras de outro proxy (nginx do host, load balancer), o peer
+# TCP e o gateway do docker e nao o cliente. trusted_proxies faz o Caddy resolver
+# {client_ip} pelo X-Forwarded-For recebido, ignorando os saltos internos.
+{
+	servers {
+		trusted_proxies static private_ranges
+		client_ip_headers X-Forwarded-For
+	}
+}
+
 {$CADDY_ADDR} {
     encode gzip
 
@@ -26,8 +36,8 @@
     handle @api {
         reverse_proxy plus-api:21114 {
             header_up Host {host}
-            header_up X-Real-IP {remote_host}
-            header_up X-Forwarded-For {remote_host}
+            header_up X-Real-IP {client_ip}
+            header_up X-Forwarded-For {client_ip}
             header_up X-Forwarded-Proto {scheme}
         }
     }
