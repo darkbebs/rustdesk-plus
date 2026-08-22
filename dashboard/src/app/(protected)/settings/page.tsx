@@ -9,7 +9,24 @@ import {
   type ServerConfig,
 } from "@/lib/api";
 import { getStoredUser } from "@/lib/auth";
-import { defenderExclusionCmd, installCmdFor } from "@/lib/install-cmd";
+import { defenderExclusionCmd, installCmdFor, tlsCmd } from "@/lib/install-cmd";
+
+/** Um comando numerado da instalação por linha de comando, com botão de copiar. */
+function CmdStep({ n, label, cmd }: { n: number; label: string; cmd: string }) {
+  return (
+    <div className="space-y-1">
+      <p className="text-xs text-slate-400">
+        {n}. {label}
+      </p>
+      <div className="flex items-center gap-2">
+        <code className="flex-1 bg-slate-900 text-green-400 text-xs font-mono rounded-xl px-4 py-2.5 overflow-x-auto whitespace-nowrap">
+          {cmd}
+        </code>
+        <CopyButton text={cmd} />
+      </div>
+    </div>
+  );
+}
 
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
@@ -222,24 +239,23 @@ export default function SettingsPage() {
           <div className="space-y-2">
             <p className="text-xs font-semibold text-slate-400 uppercase tracking-widest">Instalar via PowerShell</p>
             <p className="text-xs text-slate-400">
-              Execute no PC do cliente como Administrador, os dois comandos na ordem:
+              Execute no PC do cliente como Administrador, um comando de cada vez:
             </p>
-            <p className="text-xs text-slate-400">
-              1. Exceções no antivírus — o Defender bloqueia a gravação da senha sem avisar:
-            </p>
-            <div className="flex items-center gap-2">
-              <code className="flex-1 bg-slate-900 text-green-400 text-xs font-mono rounded-xl px-4 py-2.5 overflow-x-auto whitespace-nowrap">
-                {defenderExclusionCmd}
-              </code>
-              <CopyButton text={defenderExclusionCmd} />
-            </div>
-            <p className="text-xs text-slate-400">2. Instalador — baixa e instala automaticamente:</p>
-            <div className="flex items-center gap-2">
-              <code className="flex-1 bg-slate-900 text-green-400 text-xs font-mono rounded-xl px-4 py-2.5 overflow-x-auto whitespace-nowrap">
-                {installCmdFor(config.api_url, config.install_code)}
-              </code>
-              <CopyButton text={installCmdFor(config.api_url, config.install_code)} />
-            </div>
+            <CmdStep
+              n={1}
+              label="Exceções no antivírus — o Defender bloqueia a gravação da senha sem avisar:"
+              cmd={defenderExclusionCmd}
+            />
+            <CmdStep
+              n={2}
+              label="TLS 1.2 — só é preciso em Windows antigo; se falhar, siga para o 3:"
+              cmd={tlsCmd}
+            />
+            <CmdStep
+              n={3}
+              label="Instalador — baixa e instala automaticamente:"
+              cmd={installCmdFor(config.api_url, config.install_code)}
+            />
             <div className="flex items-center gap-2 pt-1">
               <span className="text-xs text-slate-400">Código:</span>
               <span className="font-mono text-sm font-bold text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1 tracking-widest">

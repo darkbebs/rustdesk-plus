@@ -1,6 +1,11 @@
 // Comandos de instalação exibidos no dashboard.
 //
-// A instalação é apresentada em dois passos porque o antivírus é o suspeito
+// Cada passo vai num comando separado, e não numa linha só com `;`: assim um
+// que falhe (antivírus de terceiros sem Add-MpPreference, PowerShell que recusa
+// mexer no ServicePointManager) não leva a instalação junto, e dá para ver qual
+// foi.
+//
+// A instalação é apresentada em passos porque o antivírus é o suspeito
 // número um quando a senha de acesso não fica gravada: o "--password" do
 // cliente sai com código 0 mesmo quando a gravação do config é barrada, e o
 // bloqueio não aparece em lugar nenhum. Rodar as exclusões antes, num comando
@@ -31,11 +36,29 @@ export const defenderExclusionCmd =
   `catch { Write-Host "Defender indisponivel - adicione as excecoes no seu antivirus." -ForegroundColor Yellow }`;
 
 /**
- * Passo 2 — download e execução do instalador.
- * O prefixo de TLS 1.2 é para PowerShell antigo (Win 7/8/2012/2016), que tenta
- * TLS 1.0 e falha no HTTPS moderno. Não desabilita validação de certificado.
+ * Passo 2 — TLS 1.2.
+ *
+ * Serve para PowerShell antigo (Win 7/8/2012/2016), que tenta TLS 1.0 e falha
+ * no HTTPS moderno. Não desabilita validação de certificado.
+ *
+ * Vai num comando próprio, e não grudado no `irm`, porque nem toda máquina
+ * aceita essa atribuição: no PowerShell 7 o ServicePointManager está obsoleto e
+ * em política restrita a linha pode ser recusada. Colado antes do `irm` com
+ * `;`, o erro derrubava a instalação junto; sozinho e em try/catch, falha só
+ * ele — quem já negocia TLS 1.2 por padrão (Windows 10/11 atualizado) não
+ * precisa dele de qualquer forma.
+ *
+ * O enum em vez da string 'Tls12': a conversão implícita é o que falha em parte
+ * dos casos.
  */
+export const tlsCmd =
+  `try { [Net.ServicePointManager]::SecurityProtocol = ` +
+  `[Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; ` +
+  `Write-Host "TLS 1.2 habilitado." -ForegroundColor Green } ` +
+  `catch { Write-Host "TLS 1.2 ja e o padrao nesta versao do Windows." -ForegroundColor Yellow }`;
+
+/** Passo 3 — download e execução do instalador. */
 export function installCmdFor(apiUrl: string, installCode: string): string {
   const base = apiUrl.replace(/\/$/, "");
-  return `[Net.ServicePointManager]::SecurityProtocol='Tls12'; irm "${base}/i/${installCode}" | iex`;
+  return `irm "${base}/i/${installCode}" | iex`;
 }

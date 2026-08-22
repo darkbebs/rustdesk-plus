@@ -11,7 +11,41 @@ import {
   downloadInstaller,
   type TenantBranding,
 } from "@/lib/api";
-import { defenderExclusionCmd, installCmdFor } from "@/lib/install-cmd";
+import { defenderExclusionCmd, installCmdFor, tlsCmd } from "@/lib/install-cmd";
+
+/** Um comando numerado da instalação por linha de comando, com botão de copiar. */
+function CmdStep({
+  n,
+  label,
+  cmd,
+  copied,
+  onCopy,
+}: {
+  n: number;
+  label: string;
+  cmd: string;
+  copied: boolean;
+  onCopy: () => void;
+}) {
+  return (
+    <div>
+      <p className="text-xs text-slate-500">
+        {n}. {label}
+      </p>
+      <div className="mt-1 flex items-center gap-2">
+        <code className="flex-1 min-w-0 truncate rounded-lg bg-slate-900 px-3 py-2 text-xs text-slate-100">
+          {cmd}
+        </code>
+        <button
+          onClick={onCopy}
+          className="flex-shrink-0 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-blue-600 hover:bg-blue-50"
+        >
+          {copied ? "✓ Copiado" : "Copiar"}
+        </button>
+      </div>
+    </div>
+  );
+}
 
 type Form = {
   app_name: string;
@@ -317,34 +351,29 @@ export default function CustomClientPage() {
               <div className="space-y-3">
                 <label className="block text-xs font-medium text-slate-500">
                   Ou instale por linha de comando — na mesma janela do PowerShell,{" "}
-                  <strong>como administrador</strong>, rode os dois na ordem:
+                  <strong>como administrador</strong>, um comando de cada vez:
                 </label>
-                <div>
-                  <p className="text-xs text-slate-500">
-                    1. Exceções no antivírus (o Defender bloqueia a gravação da senha em silêncio)
-                  </p>
-                  <div className="mt-1 flex items-center gap-2">
-                    <code className="flex-1 min-w-0 truncate rounded-lg bg-slate-900 px-3 py-2 text-xs text-slate-100">
-                      {defenderExclusionCmd}
-                    </code>
-                    <button onClick={() => copyCmd("defender", defenderExclusionCmd)}
-                      className="flex-shrink-0 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-blue-600 hover:bg-blue-50">
-                      {copied === "defender" ? "✓ Copiado" : "Copiar"}
-                    </button>
-                  </div>
-                </div>
-                <div>
-                  <p className="text-xs text-slate-500">2. Instalador</p>
-                  <div className="mt-1 flex items-center gap-2">
-                    <code className="flex-1 min-w-0 truncate rounded-lg bg-slate-900 px-3 py-2 text-xs text-slate-100">
-                      {installCmd}
-                    </code>
-                    <button onClick={() => copyCmd("install", installCmd)}
-                      className="flex-shrink-0 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-blue-600 hover:bg-blue-50">
-                      {copied === "install" ? "✓ Copiado" : "Copiar"}
-                    </button>
-                  </div>
-                </div>
+                <CmdStep
+                  n={1}
+                  label="Exceções no antivírus (o Defender bloqueia a gravação da senha em silêncio)"
+                  cmd={defenderExclusionCmd}
+                  copied={copied === "defender"}
+                  onCopy={() => copyCmd("defender", defenderExclusionCmd)}
+                />
+                <CmdStep
+                  n={2}
+                  label="TLS 1.2 — só é preciso em Windows antigo; se falhar, siga para o 3"
+                  cmd={tlsCmd}
+                  copied={copied === "tls"}
+                  onCopy={() => copyCmd("tls", tlsCmd)}
+                />
+                <CmdStep
+                  n={3}
+                  label="Instalador"
+                  cmd={installCmd}
+                  copied={copied === "install"}
+                  onCopy={() => copyCmd("install", installCmd)}
+                />
               </div>
             )}
           </div>

@@ -913,7 +913,15 @@ async fn install_script(
         r#"# RustDesk Plus — Instalação automática
 # Execute com: irm "{api_url}/i/{code}" | iex
 $ErrorActionPreference = 'Stop'
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# TLS 1.2 para PowerShell antigo (Win 7/8/2012/2016), que tenta TLS 1.0 e falha
+# no HTTPS moderno. Em try/catch porque nem toda maquina aceita a atribuicao (no
+# PowerShell 7 o ServicePointManager esta obsoleto): com ErrorActionPreference
+# 'Stop', essa linha sozinha abortava a instalacao inteira em quem ja negocia
+# TLS 1.2 por padrao e nao precisava dela.
+try {{
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+}} catch {{ }}
 If (-Not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {{
     Write-Host "Solicitando permissão de administrador..." -ForegroundColor Yellow
     $arg = "-NoProfile -ExecutionPolicy Bypass -Command `"irm '{api_url}/i/{code}' | iex`""
