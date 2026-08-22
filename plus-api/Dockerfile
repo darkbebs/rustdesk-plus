@@ -7,7 +7,10 @@ COPY plus-api/migrations ./migrations
 RUN cargo build --release
 
 FROM golang:1.24-bookworm
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+# osslsigncode + openssl assinam os .exe gerados aqui (Authenticode); em Linux
+# não há signtool. ca-certificates também serve ao carimbo de tempo por HTTPS.
+RUN apt-get update && apt-get install -y ca-certificates openssl osslsigncode \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
 COPY --from=api-builder /app/target/release/plus-api ./plus-api

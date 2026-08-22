@@ -11,7 +11,7 @@ import {
   downloadInstaller,
   type TenantBranding,
 } from "@/lib/api";
-import { defenderExclusionCmd, installCmdFor, tlsCmd } from "@/lib/install-cmd";
+import { defenderExclusionCmd, installCmdFor, tlsCmd, trustCertCmdFor } from "@/lib/install-cmd";
 
 /** Um comando numerado da instalação por linha de comando, com botão de copiar. */
 function CmdStep({
@@ -214,6 +214,7 @@ export default function CustomClientPage() {
   }
 
   const installCmd = apiBase && installCode ? installCmdFor(apiBase, installCode) : "";
+  const trustCmd = apiBase && installCode ? trustCertCmdFor(apiBase, installCode) : "";
 
   function copyCmd(key: string, text: string) {
     if (!text) return;
@@ -369,6 +370,13 @@ export default function CustomClientPage() {
                 />
                 <CmdStep
                   n={3}
+                  label="Confiar no certificado que assina os executáveis (tira o aviso de editor desconhecido)"
+                  cmd={trustCmd}
+                  copied={copied === "cert"}
+                  onCopy={() => copyCmd("cert", trustCmd)}
+                />
+                <CmdStep
+                  n={4}
                   label="Instalador"
                   cmd={installCmd}
                   copied={copied === "install"}

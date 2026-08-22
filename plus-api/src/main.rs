@@ -6,6 +6,7 @@ mod error;
 mod installer;
 mod models;
 mod routes;
+mod signing;
 mod state;
 
 use axum::{routing::get, Router};

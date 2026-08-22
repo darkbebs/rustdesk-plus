@@ -26,7 +26,7 @@ fn copy_file(source: impl AsRef<Path>, target: impl AsRef<Path>) -> anyhow::Resu
     Ok(())
 }
 
-fn generated_dir() -> PathBuf {
+pub fn generated_dir() -> PathBuf {
     let base = PathBuf::from(
         std::env::var("INSTALLER_PATH")
             .unwrap_or_else(|_| "/app/generated/rustdesk-installer.exe".to_string()),
@@ -46,6 +46,7 @@ pub fn build(
     tenant_id: Uuid,
     rustdesk_password: &str,
     install_code: &str,
+    signing_name: &str,
 ) -> anyhow::Result<PathBuf> {
     if config.server_ip.trim().is_empty()
         || config.server_key.trim().is_empty()
@@ -68,6 +69,9 @@ pub fn build(
         m["_tenant"] = serde_json::Value::String(tenant_id.to_string());
         m["_install_code"] = serde_json::Value::String(install_code.to_string());
         m["_agent"] = serde_json::Value::Bool(agent_on);
+        // No metadata para o cache cair quando o nome da empresa mudar: esse
+        // nome vive dentro do certificado que assina o binário.
+        m["_signer"] = serde_json::Value::String(signing_name.to_string());
         serde_json::to_vec(&m)?
     };
 
@@ -79,6 +83,9 @@ pub fn build(
     {
         return Ok(output_path);
     }
+
+    fs::create_dir_all(&generated_dir)?;
+    let cert = crate::signing::ensure_cert(&generated_dir, tenant_id, signing_name)?;
 
     let source_root = PathBuf::from(
         std::env::var("INSTALLER_SOURCE_DIR")
@@ -123,6 +130,11 @@ pub fn build(
             "build do agente",
         )?;
 
+        // Assinar antes de embutir: o instalador extrai este mesmo arquivo, e
+        // um agente sem assinatura dentro de um instalador assinado é
+        // exatamente o que o antivírus sinaliza.
+        crate::signing::sign(&cert, &agent_exe, "RustDesk Plus Agent", &config.api_url)?;
+
         // Salva o binário do agente separado (usado pelo auto-update)
         fs::create_dir_all(&generated_dir)?;
         fs::copy(&agent_exe, &agent_path)?;
@@ -162,6 +174,14 @@ pub fn build(
     }
     fs::rename(&temporary_output, &output_path)
         .or_else(|_| fs::copy(&temporary_output, &output_path).map(|_| ()))?;
+    crate::signing::sign(
+        &cert,
+        &output_path,
+        "RustDesk Plus Installer",
+        &config.api_url,
+    )?;
+    // Metadata por último: se a assinatura falhar, o cache não fica marcado
+    // como pronto e a próxima chamada refaz tudo.
     fs::write(metadata_path, expected_metadata)?;
     let _ = fs::remove_dir_all(work_root);
     Ok(output_path)

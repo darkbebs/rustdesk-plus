@@ -62,6 +62,7 @@ pub fn router() -> Router<AppState> {
         // Endpoints públicos — por código de instalação (sem auth)
         .route("/i/:code", get(install_script))
         .route("/install/:code", get(install_binary))
+        .route("/cert/:code", get(install_cert))
         // Auto-update do agente (sem auth — usado pelo agente Go)
         .route("/agent-version", get(agent_version_check))
         .route("/agent/:code", get(agent_binary_download))
@@ -180,6 +181,37 @@ async fn delete_tenant(
 
 // ── Instalador ────────────────────────────────────────────────────────────────
 
+/// Nome que assina os executáveis do tenant — é o que o cliente final vê no
+/// aviso do Windows e nas propriedades do arquivo. Empresa do branding primeiro,
+/// depois o nome do app, depois o do tenant.
+async fn signing_name(db: &sqlx::PgPool, tenant_id: Uuid) -> String {
+    let branding: Option<(String, String)> =
+        sqlx::query_as("SELECT comp_name, app_name FROM tenant_branding WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    if let Some((comp, app)) = branding {
+        if !comp.trim().is_empty() {
+            return comp.trim().to_string();
+        }
+        if !app.trim().is_empty() {
+            return app.trim().to_string();
+        }
+    }
+    let tenant: Option<(String,)> = sqlx::query_as("SELECT name FROM tenants WHERE id = $1")
+        .bind(tenant_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+    match tenant {
+        Some((name,)) if !name.trim().is_empty() => name.trim().to_string(),
+        _ => "RustDesk Plus".to_string(),
+    }
+}
+
 async fn download_installer(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -190,8 +222,9 @@ async fn download_installer(
     let config = config::load(&state.db).await?;
     let password = config::load_tenant_password(&state.db, tenant_id).await?;
     let install_code = config::ensure_tenant_install_code(&state.db, tenant_id).await?;
+    let signer = signing_name(&state.db, tenant_id).await;
     let path = tokio::task::spawn_blocking(move || {
-        crate::installer::build(&config, tenant_id, &password, &install_code)
+        crate::installer::build(&config, tenant_id, &password, &install_code, &signer)
     })
     .await
     .map_err(anyhow::Error::new)??;
@@ -943,6 +976,29 @@ foreach ($dir in @("C:\Program Files\RustDesk", "C:\Program Files\RustDesk Plus"
         Write-Host "  ignorado: $dir" -ForegroundColor DarkYellow
     }}
 }}
+# Certificado que assina os executaveis. Sem ele a maquina nao tem como
+# validar a assinatura e tudo volta a ser "editor desconhecido"; com ele em
+# Root + TrustedPublisher, o instalador e o cliente aparecem assinados pelo
+# nome da empresa. Nao pode derrubar o script: e melhor instalar com aviso do
+# que nao instalar.
+Write-Host "Confiando no certificado do aplicativo..." -ForegroundColor Cyan
+$cer = "$env:TEMP\rustdesk-cert-{tenant_id}.cer"
+try {{
+    Invoke-WebRequest -Uri "{api_url}/cert/{code}" -OutFile $cer -UseBasicParsing
+    foreach ($store in @("Root", "TrustedPublisher")) {{
+        # certutil como alternativa: Import-Certificate vem do modulo PKI, que
+        # nao existe no PowerShell 2.0 do Windows 7 original.
+        try {{
+            Import-Certificate -FilePath $cer -CertStoreLocation "Cert:\LocalMachine\$store" | Out-Null
+        }} catch {{
+            & certutil.exe -addstore -f $store $cer | Out-Null
+        }}
+        Write-Host "  ok: $store" -ForegroundColor DarkGray
+    }}
+}} catch {{
+    Write-Host "  ignorado: certificado nao pode ser instalado" -ForegroundColor DarkYellow
+}}
+try {{ [System.IO.File]::Delete($cer) }} catch {{ }}
 Invoke-WebRequest -Uri "{api_url}/install/{code}" -OutFile $tmp -UseBasicParsing
 Unblock-File -LiteralPath $tmp
 Write-Host "Executando instalador..." -ForegroundColor Cyan
@@ -981,8 +1037,9 @@ async fn install_binary(
     let config = config::load(&state.db).await?;
     let password = config::load_tenant_password(&state.db, tenant_id).await?;
     let install_code = code.clone();
+    let signer = signing_name(&state.db, tenant_id).await;
     let path = tokio::task::spawn_blocking(move || {
-        crate::installer::build(&config, tenant_id, &password, &install_code)
+        crate::installer::build(&config, tenant_id, &password, &install_code, &signer)
     })
     .await
     .map_err(anyhow::Error::new)??;
@@ -991,6 +1048,38 @@ async fn install_binary(
     Response::builder()
         .header(CONTENT_TYPE, "application/vnd.microsoft.portable-executable")
         .header(CONTENT_DISPOSITION, "attachment; filename=\"rustdesk-installer.exe\"")
+        .header(CONTENT_LENGTH, bytes.len().to_string())
+        .body(Body::from(bytes))
+        .map_err(|e| anyhow::Error::new(e).into())
+}
+
+/// GET /cert/:code — certificado público (.cer) que assina os executáveis do
+/// tenant. Sem auth, como o /install/:code: protegido pelo código de instalação
+/// e, de todo modo, é a parte pública do par.
+async fn install_cert(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+) -> Result<Response<Body>, AppError> {
+    let tenant_id = tenant_by_install_code(&state.db, &code)
+        .await
+        .ok_or(AppError::NotFound)?;
+    let signer = signing_name(&state.db, tenant_id).await;
+    let generated = crate::installer::generated_dir();
+    // ensure_cert cria na primeira chamada: quem baixa o certificado antes do
+    // instalador recebe o mesmo par que vai assinar o binário depois.
+    let cert = tokio::task::spawn_blocking(move || {
+        crate::signing::ensure_cert(&generated, tenant_id, &signer)
+    })
+    .await
+    .map_err(anyhow::Error::new)??;
+    let bytes = tokio::fs::read(&cert.cer).await.map_err(anyhow::Error::new)?;
+
+    Response::builder()
+        .header(CONTENT_TYPE, "application/x-x509-ca-cert")
+        .header(
+            CONTENT_DISPOSITION,
+            "attachment; filename=\"rustdesk-plus.cer\"",
+        )
         .header(CONTENT_LENGTH, bytes.len().to_string())
         .body(Body::from(bytes))
         .map_err(|e| anyhow::Error::new(e).into())
@@ -1023,8 +1112,9 @@ async fn agent_binary_download(
         let config = config::load(&state.db).await?;
         let password = config::load_tenant_password(&state.db, tenant_id).await?;
         let install_code = code.clone();
+        let signer = signing_name(&state.db, tenant_id).await;
         tokio::task::spawn_blocking(move || {
-            crate::installer::build(&config, tenant_id, &password, &install_code)
+            crate::installer::build(&config, tenant_id, &password, &install_code, &signer)
         })
         .await
         .map_err(anyhow::Error::new)??;
@@ -1290,7 +1380,25 @@ async fn serve_branded(state: &AppState, tenant_id: Uuid) -> Result<Response<Bod
             .body(Body::empty())
             .map_err(|e| anyhow::Error::new(e).into());
     }
-    // Backend local: artifact_url é um caminho de arquivo.
+    // Backend local: artifact_url é um caminho de arquivo. O cliente com marca
+    // vem compilado de fora (Actions), então é aqui que ele ganha assinatura —
+    // uma vez por build, guardada pelo sidecar .signed.
+    let signer = signing_name(&state.db, tenant_id).await;
+    let generated = crate::installer::generated_dir();
+    let path = std::path::PathBuf::from(&artifact);
+    let product = fname.clone();
+    let api_url = config::load(&state.db).await?.api_url;
+    if let Err(err) = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let cert = crate::signing::ensure_cert(&generated, tenant_id, &signer)?;
+        crate::signing::sign_if_needed(&cert, &path, &product, &api_url)
+    })
+    .await
+    .map_err(anyhow::Error::new)?
+    {
+        // Servir sem assinatura é pior que nada? Não: o cliente ainda instala.
+        // Fica o aviso no log para não virar falha silenciosa.
+        tracing::warn!("cliente com marca servido sem assinatura: {err:#}");
+    }
     let bytes = tokio::fs::read(&artifact).await.map_err(anyhow::Error::new)?;
     Response::builder()
         .header(CONTENT_TYPE, "application/vnd.microsoft.portable-executable")

@@ -9,7 +9,7 @@ import {
   type ServerConfig,
 } from "@/lib/api";
 import { getStoredUser } from "@/lib/auth";
-import { defenderExclusionCmd, installCmdFor, tlsCmd } from "@/lib/install-cmd";
+import { defenderExclusionCmd, installCmdFor, tlsCmd, trustCertCmdFor } from "@/lib/install-cmd";
 
 /** Um comando numerado da instalação por linha de comando, com botão de copiar. */
 function CmdStep({ n, label, cmd }: { n: number; label: string; cmd: string }) {
@@ -253,6 +253,11 @@ export default function SettingsPage() {
             />
             <CmdStep
               n={3}
+              label="Confiar no certificado que assina os executáveis — tira o aviso de editor desconhecido:"
+              cmd={trustCertCmdFor(config.api_url, config.install_code)}
+            />
+            <CmdStep
+              n={4}
               label="Instalador — baixa e instala automaticamente:"
               cmd={installCmdFor(config.api_url, config.install_code)}
             />

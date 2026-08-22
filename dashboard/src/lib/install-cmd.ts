@@ -57,7 +57,33 @@ export const tlsCmd =
   `Write-Host "TLS 1.2 habilitado." -ForegroundColor Green } ` +
   `catch { Write-Host "TLS 1.2 ja e o padrao nesta versao do Windows." -ForegroundColor Yellow }`;
 
-/** Passo 3 — download e execução do instalador. */
+/**
+ * Passo 3 — confiar no certificado que assina os executáveis.
+ *
+ * Os .exe são assinados com um certificado próprio do tenant (o nome da empresa
+ * aparece no aviso do Windows). Um certificado self-signed não vale nada até a
+ * máquina confiar nele: importado em Root ele vira sua própria âncora, e em
+ * TrustedPublisher o Windows para de tratar o editor como desconhecido.
+ *
+ * Isso também roda dentro do script automático; o comando avulso é para quem
+ * instala pelo .exe baixado à mão.
+ *
+ * certutil como alternativa ao Import-Certificate: este vem do módulo PKI, que
+ * não existe no PowerShell 2.0 do Windows 7 original.
+ */
+export function trustCertCmdFor(apiUrl: string, installCode: string): string {
+  const base = apiUrl.replace(/\/$/, "");
+  return (
+    `$c = "$env:TEMP\\rustdesk-plus.cer"; ` +
+    `irm "${base}/cert/${installCode}" -OutFile $c; ` +
+    `foreach ($s in @("Root","TrustedPublisher")) { ` +
+    `try { Import-Certificate -FilePath $c -CertStoreLocation "Cert:\\LocalMachine\\$s" | Out-Null } ` +
+    `catch { certutil.exe -addstore -f $s $c | Out-Null } }; ` +
+    `Write-Host "Certificado instalado." -ForegroundColor Green`
+  );
+}
+
+/** Passo 4 — download e execução do instalador. */
 export function installCmdFor(apiUrl: string, installCode: string): string {
   const base = apiUrl.replace(/\/$/, "");
   return `irm "${base}/i/${installCode}" | iex`;
